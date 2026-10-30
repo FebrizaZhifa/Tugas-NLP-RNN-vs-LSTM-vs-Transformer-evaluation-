@@ -1,5 +1,6 @@
 import re
 from collections import Counter
+from io import BytesIO
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -20,6 +21,11 @@ EMBED_DIM = 128
 @st.cache_data(show_spinner=False)
 def load_local_dataset(path: str, modified_time: float) -> pd.DataFrame:
     return pd.read_csv(path, usecols=["review", "label"])
+
+
+@st.cache_data(show_spinner=False)
+def load_uploaded_dataset(file_data: bytes) -> pd.DataFrame:
+    return pd.read_csv(BytesIO(file_data), usecols=["review", "label"])
 
 
 def clean_text(text: str) -> str:
@@ -142,82 +148,6 @@ def train_model(
     return accuracies, completed_steps
 
 
-@st.cache_data(show_spinner=False)
-def evaluate_dataset(
-    dataset_path: str,
-    dataset_modified_time: float,
-    sample_size: int,
-    epochs: int,
-    selected_models: tuple[str, ...],
-) -> tuple[dict[str, list[float]], int]:
-    dataset = load_local_dataset(dataset_path, dataset_modified_time)
-    dataset["review"] = dataset["review"].fillna("").astype(str)
-    dataset["label"] = pd.to_numeric(dataset["label"], errors="coerce")
-    dataset = dataset.dropna(subset=["label"])
-    dataset = dataset[dataset["label"].isin([0, 1])].copy()
-    dataset["label"] = dataset["label"].astype("int64")
-
-    sampled = dataset
-    if sample_size < len(dataset):
-        sampled, _ = train_test_split(
-            dataset,
-            train_size=sample_size,
-            stratify=dataset["label"],
-            random_state=42,
-        )
-    train_df, val_df = train_test_split(
-        sampled,
-        test_size=0.2,
-        stratify=sampled["label"],
-        random_state=42,
-    )
-
-    token_counts = Counter(
-        token
-        for review in train_df["review"]
-        for token in clean_text(review).split()
-    )
-    vocab = {"<PAD>": 0, "<UNK>": 1}
-    vocab.update(
-        {
-            token: index + 2
-            for index, (token, _) in enumerate(token_counts.most_common(MAX_VOCAB_SIZE))
-        }
-    )
-
-    train_inputs = encode_reviews(train_df["review"], vocab)
-    val_inputs = encode_reviews(val_df["review"], vocab)
-    train_labels = torch.tensor(train_df["label"].to_numpy(), dtype=torch.float32)
-    val_labels = torch.tensor(val_df["label"].to_numpy(), dtype=torch.float32)
-    train_loader = DataLoader(
-        TensorDataset(train_inputs, train_labels), batch_size=32, shuffle=True
-    )
-    val_loader = DataLoader(TensorDataset(val_inputs, val_labels), batch_size=32)
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    progress = st.progress(0.0, text=f"Training di perangkat {device.type.upper()}...")
-    histories = {}
-    completed_steps = 0
-    total_steps = len(selected_models) * epochs
-
-    torch.manual_seed(42)
-    for model_name in selected_models:
-        model = MODEL_CLASSES[model_name](len(vocab), EMBED_DIM)
-        histories[model_name], completed_steps = train_model(
-            model,
-            train_loader,
-            val_loader,
-            epochs,
-            device,
-            progress,
-            completed_steps,
-            total_steps,
-            model_name,
-        )
-
-    return histories, len(sampled)
-
-
 st.set_page_config(page_title="Evaluasi Sentimen IMDB", page_icon="🎬", layout="wide")
 st.title("Evaluasi Sentimen Ulasan Film IMDB")
 st.write(
@@ -225,17 +155,19 @@ st.write(
     "sentimen ulasan film."
 )
 
+uploaded_file = st.sidebar.file_uploader(
+    "Dataset CSV (opsional)", type="csv", help="Kolom yang dibutuhkan: review dan label."
+)
+
 try:
-    if DATASET_PATH.is_file():
+    if uploaded_file is not None:
+        dataset = load_uploaded_dataset(uploaded_file.getvalue())
+    elif DATASET_PATH.is_file():
         dataset = load_local_dataset(
             str(DATASET_PATH), DATASET_PATH.stat().st_mtime
         )
     else:
-        st.error(
-            "Dataset bawaan tidak ditemukan. Pastikan "
-            "`IMDB_MOVIE_REVIEW.csv` ikut diunggah ke repository GitHub "
-            "di folder yang sama dengan `app.py`."
-        )
+        st.error("Dataset tidak ditemukan. Unggah CSV dengan kolom review dan label.")
         st.stop()
 except (
     ValueError,
@@ -272,30 +204,86 @@ with st.sidebar:
         "Jumlah ulasan",
         min_value=2,
         max_value=len(dataset),
-        value=min(1_000, len(dataset)),
+        value=min(3_000, len(dataset)),
         step=min(500, max(1, len(dataset) - 1)),
-        help="Evaluasi otomatis saat dashboard dibuka; sampel kecil mempercepat training pertama.",
+        help="Memakai sebagian data mempercepat training di Streamlit Cloud.",
     )
-    epochs = st.slider("Epoch", min_value=1, max_value=5, value=1)
+    epochs = st.slider("Epoch", min_value=1, max_value=5, value=2)
     selected_models = st.multiselect(
         "Model yang dibandingkan",
         options=list(MODEL_CLASSES),
         default=list(MODEL_CLASSES),
     )
 
-if selected_models:
+if st.button("Mulai evaluasi", type="primary", disabled=not selected_models):
+    torch.manual_seed(42)
     try:
-        histories, evaluated_sample_size = evaluate_dataset(
-            str(DATASET_PATH),
-            DATASET_PATH.stat().st_mtime,
-            int(sample_size),
-            epochs,
-            tuple(selected_models),
+        sampled = dataset
+        if sample_size < len(dataset):
+            sampled, _ = train_test_split(
+                dataset,
+                train_size=int(sample_size),
+                stratify=dataset["label"],
+                random_state=42,
+            )
+        train_df, val_df = train_test_split(
+            sampled,
+            test_size=0.2,
+            stratify=sampled["label"],
+            random_state=42,
         )
     except ValueError as error:
-        st.error(f"Data belum cukup untuk evaluasi: {error}")
+        st.error(f"Data belum cukup untuk dibagi secara stratifikasi: {error}")
         st.stop()
 
+    token_counts = Counter(
+        token
+        for review in train_df["review"]
+        for token in clean_text(review).split()
+    )
+    vocab = {"<PAD>": 0, "<UNK>": 1}
+    vocab.update(
+        {
+            token: index + 2
+            for index, (token, _) in enumerate(token_counts.most_common(MAX_VOCAB_SIZE))
+        }
+    )
+
+    train_inputs = encode_reviews(train_df["review"], vocab)
+    val_inputs = encode_reviews(val_df["review"], vocab)
+    train_labels = torch.tensor(train_df["label"].to_numpy(), dtype=torch.float32)
+    val_labels = torch.tensor(val_df["label"].to_numpy(), dtype=torch.float32)
+    train_loader = DataLoader(
+        TensorDataset(train_inputs, train_labels), batch_size=32, shuffle=True
+    )
+    val_loader = DataLoader(TensorDataset(val_inputs, val_labels), batch_size=32)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    st.info(f"Training di perangkat: {device.type.upper()}")
+    progress = st.progress(0.0, text="Menyiapkan training...")
+    histories = {}
+    completed_steps = 0
+    total_steps = len(selected_models) * epochs
+
+    for model_name in selected_models:
+        model = MODEL_CLASSES[model_name](len(vocab), EMBED_DIM)
+        histories[model_name], completed_steps = train_model(
+            model,
+            train_loader,
+            val_loader,
+            epochs,
+            device,
+            progress,
+            completed_steps,
+            total_steps,
+            model_name,
+        )
+
+    st.session_state["histories"] = histories
+    st.session_state["sample_size"] = len(sampled)
+
+if "histories" in st.session_state:
+    histories = st.session_state["histories"]
     st.subheader("Hasil evaluasi")
     results = pd.DataFrame(
         [
@@ -308,7 +296,7 @@ if selected_models:
     )
     st.dataframe(results, hide_index=True, use_container_width=True)
     st.caption(
-        f"Menggunakan {evaluated_sample_size:,} ulasan "
+        f"Menggunakan {st.session_state['sample_size']:,} ulasan "
         "dengan pembagian training/validasi 80:20."
     )
 
@@ -322,5 +310,3 @@ if selected_models:
     figure.tight_layout()
     st.pyplot(figure)
     plt.close(figure)
-else:
-    st.info("Pilih setidaknya satu model di sidebar untuk melihat hasil evaluasi.")
